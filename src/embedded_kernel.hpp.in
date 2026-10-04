@@ -1,0 +1,2 @@
+#pragma once
+inline constexpr const char* kernel_source = R"ER2KERNEL(@ER2_KERNEL_SOURCE@)ER2KERNEL";

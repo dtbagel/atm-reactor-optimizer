@@ -1,0 +1,7 @@
+/build*/
+/tools/local/
+/work/
+/outputs/
+__pycache__/
+best_reactor.json
+best_reactor.txt

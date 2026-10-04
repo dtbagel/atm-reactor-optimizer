@@ -1,0 +1,21 @@
+R = fuel column; U = Unobtainium; each column is 7 blocks tall
+
+U U U U U U U
+U U U U U U U
+U U R R U R U
+U U R U R U U
+U U R R U R U
+U U U U U U U
+U U U U U U U
+
+Power: 352387.607038 FE/t
+Fuel: 0.281708469473 mB/t
+Efficiency: 1250894.61349 FE/mB
+Rod columns: 8
+Fuel heat: 1651.45225444 C
+Reactor heat: 1667.36332208 C
+Fertility: 2853.66113736
+Search time: 10.0000987 s
+Candidates: 26279936
+Backend: cuda
+Exact CPU verified: yes

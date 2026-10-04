@@ -1,0 +1,9 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {"name":"release", "generator":"Ninja", "binaryDir":"${sourceDir}/build", "cacheVariables":{"CMAKE_BUILD_TYPE":"Release"}},
+    {"name":"release-native", "inherits":"release", "binaryDir":"${sourceDir}/build-native", "cacheVariables":{"ER2_NATIVE":"ON"}}
+  ],
+  "buildPresets": [{"name":"release", "configurePreset":"release"},{"name":"release-native", "configurePreset":"release-native"}],
+  "testPresets": [{"name":"release", "configurePreset":"release", "output":{"outputOnFailure":true}}]
+}

@@ -1,0 +1,19 @@
+{
+  "settings": {
+    "threads": 24, "seconds": 10, "seed": 1337, "evaluation_budget": 0,
+    "min_rods": 1, "max_rods": 35, "min_power": 350000,
+    "insertion_percent": 0, "fuel_fill": 1, "variant_efficiency": 1,
+    "search_max_ticks": 4500, "search_min_ticks": 1500, "sample_ticks": 500, "final_ticks": 20000, "final_min_ticks": 6666, "final_sample_ticks": 1000,
+    "backend_requested": "cuda", "backend": "cuda", "math": "fast", "objective": "efficiency", "fixed_ticks": false,
+    "batch": 65536, "device_index": 0, "device_name": "NVIDIA GeForce RTX 3080 Ti",
+    "geometry": [7,7,7], "atm10_fuel_multiplier": 0.8, "atm10_power_multiplier": 12,
+    "unobtainium": {"absorption": 0.972, "heat_efficiency": 0.91, "moderation": 3.074, "conductivity": 5.0},
+    "source_schedule": "one event per tick, columns cycled as in ato.py"
+  },
+  "run": {"search_seconds": 10.000098700000001, "candidate_evaluations": 26279936, "reactor_ticks": 118259712000, "layouts_per_second": 2627967.6619591764, "exact_cpu_verified": true},
+  "result": {
+    "mask": 11853824000, "layout": "U U U U U U U\nU U U U U U U\nU U R R U R U\nU U R U R U U\nU U R R U R U\nU U U U U U U\nU U U U U U U\n", "rod_columns": 8, "rod_blocks": 56,
+    "score": 1250894.6134889219, "power_fe_t": 352387.60703814373, "fuel_mb_t": 0.28170846947312761, "efficiency_fe_per_mb": 1250894.6134889219,
+    "fuel_heat_c": 1651.4522544396386, "reactor_heat_c": 1667.3633220816794, "fertility": 2853.66113736237, "ticks": 20000
+  }
+}
