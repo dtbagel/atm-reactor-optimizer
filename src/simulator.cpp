@@ -6,7 +6,7 @@ namespace er2 {
 Result evaluate_exact(Layout mask, Settings settings, SimConfig config, bool adaptive) {
     if (!adaptive) return evaluate_fixed<double>(mask,settings,config);
     if (config.sample_ticks<1 || config.sample_ticks>8192) throw std::runtime_error("sample ticks must be 1..8192");
-    Topology top(mask);
+    Topology top(mask,settings);
     if (!top.rods) return {};
     State<double> state(top,settings);
     std::array<double,8192> powers{}, fuels{};

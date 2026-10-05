@@ -53,6 +53,13 @@ def main():
     b=json.loads(second.with_suffix('.json').read_text())
     assert a['result']==b['result'],'Fixed-budget runs were nondeterministic'
     assert a['run']['candidate_evaluations']==512
+    assert a['settings']['max_rods']==49,'Default search must allow the full footprint'
+    tuning=['--agents',8,'--power-agents',2,'--elites',12,'--max-flips',49,'--mutation-percent',100,
+            '--crossover-percent',75,'--random-percent',35,'--migration-generations',2,'--restart-generations',2,'--batch',3]
+    run(*common,*tuning,'--output',first);run(*common,*tuning,'--output',second)
+    a=json.loads(first.with_suffix('.json').read_text());b=json.loads(second.with_suffix('.json').read_text())
+    assert a['result']==b['result'],'Multi-agent runs with sharing/restarts must be deterministic'
+    assert a['run']['candidate_evaluations']==512 and a['run']['generations']==171
     no_result=scratch/'infeasible'
     run('--backend','cpu','--threads',2,'--evaluations',64,'--min-power',1e12,'--output',no_result,expected=3)
     assert not no_result.with_suffix('.json').exists()
@@ -63,6 +70,9 @@ def main():
     run('--threads',0,expected=1);run('--fill',0,expected=1)
     run('--insertion','nan',expected=1);run('--evaluate','0x2000000000000',expected=1)
     run('--sample-ticks',9000,expected=1);run('--unknown',expected=1)
+    for option,value in [('--agents',0),('--agents',33),('--power-agents',5),('--elites',0),('--max-flips',0),
+                         ('--mutation-percent',101),('--random-percent',101),('--restart-generations',1000001)]:
+        run(option,value,expected=1)
     off=scratch/'fully_inserted'
     run('--backend','cpu','--threads',1,'--evaluations',8,'--insertion',100,'--output',off,expected=3)
     if args.gpu:
@@ -72,6 +82,8 @@ def main():
         data=json.loads(gpu.with_suffix('.json').read_text())
         assert data['settings']['backend']=='cuda'
         assert data['result']['power_fe_t']>=350000 and data['run']['exact_cpu_verified']
+        run('--backend','cuda','--threads',12,'--evaluations',16384,'--min-power',350000,'--output',first)
+        assert json.loads(first.with_suffix('.json').read_text())['result']==data['result'],'Fixed-budget GPU run was nondeterministic'
         # The double GPU path is separately compiled; keep its validation sample bounded.
         run('--backend','cuda','--math','exact','--self-test','--threads',4,'--validation-layouts',32)
     print('PASS: deterministic budgets, power-floor enforcement, exact verification, CLI bounds, and output JSON')

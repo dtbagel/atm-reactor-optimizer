@@ -6,7 +6,7 @@
 namespace er2 {
 class Gpu {
 public:
-    Gpu(bool exact, int device, int capacity);
+    Gpu(bool exact, int device, int capacity, int cells=49);
     ~Gpu();
     Gpu(const Gpu&)=delete;
     Gpu& operator=(const Gpu&)=delete;

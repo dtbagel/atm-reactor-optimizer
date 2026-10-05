@@ -9,9 +9,31 @@
 #endif
 
 namespace er2 {
-using Layout = unsigned long long;
+// Stable host/device ABI, supporting up to a 32 x 32 column footprint.
+struct Layout {
+    unsigned long long words[16]{};
+    ER2_INLINE constexpr Layout(unsigned long long value=0) { words[0]=value; }
+    ER2_INLINE bool test(int cell) const { return (words[cell/64] >> (cell%64)) & 1ULL; }
+    ER2_INLINE void toggle(int cell) { words[cell/64] ^= 1ULL << (cell%64); }
+    ER2_INLINE void set(int cell) { words[cell/64] |= 1ULL << (cell%64); }
+    ER2_INLINE explicit operator bool() const { for (auto w:words) if(w) return true; return false; }
+    ER2_INLINE bool operator==(const Layout& b) const { for(int i=0;i<16;++i) if(words[i]!=b.words[i]) return false; return true; }
+    ER2_INLINE bool operator!=(const Layout& b) const { return !(*this==b); }
+    ER2_INLINE bool operator<(const Layout& b) const { for(int i=15;i>=0;--i) if(words[i]!=b.words[i]) return words[i]<b.words[i]; return false; }
+    ER2_INLINE Layout operator&(const Layout& b) const { Layout r; for(int i=0;i<16;++i) r.words[i]=words[i]&b.words[i]; return r; }
+    ER2_INLINE Layout operator|(const Layout& b) const { Layout r; for(int i=0;i<16;++i) r.words[i]=words[i]|b.words[i]; return r; }
+    ER2_INLINE Layout operator~() const { Layout r; for(int i=0;i<16;++i) r.words[i]=~words[i]; return r; }
+};
+ER2_INLINE int rod_count(const Layout& mask) { int n=0; for(auto w:mask.words) while(w) {w&=w-1; ++n;} return n; }
+ER2_INLINE Layout full_mask(int cells) { Layout m; for(int i=0;i<cells;++i) m.set(i); return m; }
 constexpr Layout all_mask = (1ULL << 49) - 1;
-struct Settings { double insertion = 0, fill = 1, variant = 1; };
+struct Moderator { double absorption=0.972, heat_efficiency=0.91, moderation=3.074, conductivity=5; };
+struct Settings {
+    double insertion=0, fill=1, variant=1;
+    Moderator moderator;
+    int width=7, depth=7, height=7;
+    ER2_INLINE int cells() const { return width*depth; }
+};
 struct SimConfig { int max_ticks = 4500, min_ticks = 1500, sample_ticks = 500; };
 struct Result {
     Layout mask = 0;
@@ -52,22 +74,25 @@ template<> struct Math<float> {
 };
 struct Topology {
     // low three bits: ray length; high four bits: fuel at each step.
-    unsigned char rays[49][4];
+#ifndef ER2_TOPOLOGY_CELLS
+#define ER2_TOPOLOGY_CELLS 1024
+#endif
+    unsigned char rays[ER2_TOPOLOGY_CELLS][4];
     int rods = 0;
     double heat_transfer = 0;
-    ER2_INLINE explicit Topology(Layout mask) {
+    ER2_INLINE explicit Topology(Layout mask, Settings settings={}) {
         const int dx[4] = {1,-1,0,0}, dz[4] = {0,0,1,-1};
-        for (int cell = 0; cell < 49; ++cell) {
-            if (!(mask & (1ULL << cell))) continue;
-            int x = cell % 7, z = cell / 7;
+        for (int cell = 0; cell < settings.cells(); ++cell) {
+            if (!mask.test(cell)) continue;
+            int x = cell % settings.width, z = cell / settings.width;
             for (int d = 0; d < 4; ++d) {
                 int nx = x + dx[d], nz = z + dz[d];
-                if (nx < 0 || nx >= 7 || nz < 0 || nz >= 7) heat_transfer += 0.6;
-                else if (!(mask & (1ULL << (nz*7+nx)))) heat_transfer += 5.0;
+                if (nx < 0 || nx >= settings.width || nz < 0 || nz >= settings.depth) heat_transfer += 0.6;
+                else if (!mask.test(nz*settings.width+nx)) heat_transfer += settings.moderator.conductivity;
                 int length = 0, fuel_bits = 0;
                 for (int step = 0; step < 4; ++step) {
-                    if (nx < 0 || nx >= 7 || nz < 0 || nz >= 7) break;
-                    if (mask & (1ULL << (nz*7+nx))) fuel_bits |= 1 << step;
+                    if (nx < 0 || nx >= settings.width || nz < 0 || nz >= settings.depth) break;
+                    if (mask.test(nz*settings.width+nx)) fuel_bits |= 1 << step;
                     ++length;
                     nx += dx[d]; nz += dz[d];
                 }
@@ -75,18 +100,24 @@ struct Topology {
             }
             ++rods;
         }
-        heat_transfer *= 7;
+        heat_transfer *= settings.height;
     }
 };
 template<class T> struct State {
     T fuel_heat = 0, reactor_heat = 0, fertility = 1;
     T raw, scaled, moderation, insertion, variant, fuel_capacity, htc;
+    T absorption, heat_efficiency, moderator_moderation, reactor_capacity, cooling, heat_loss;
     ER2_INLINE State(const Topology& top, Settings settings) {
         insertion = T(settings.insertion); variant = T(settings.variant);
-        fuel_capacity = T(top.rods * 7 * 10);
+        fuel_capacity = T(top.rods * settings.height * 10);
         htc = T(top.heat_transfer);
+        absorption=T(settings.moderator.absorption); heat_efficiency=T(settings.moderator.heat_efficiency);
+        moderator_moderation=T(settings.moderator.moderation);
+        reactor_capacity=T(settings.width*settings.depth*settings.height*10);
+        cooling=T(0.6)*T(2*(settings.width*settings.depth+settings.width*settings.height+settings.depth*settings.height));
+        heat_loss=T(0.001)*T(2*((settings.width+2)*(settings.depth+2)+(settings.width+2)*(settings.height+2)+(settings.depth+2)*(settings.height+2)));
         T modifier = T(1) - insertion;
-        raw = T(top.rods * 7 * 4000) * T(settings.fill) * T(0.01) * modifier;
+        raw = T(top.rods * settings.height * 4000) * T(settings.fill) * T(0.01) * modifier;
         scaled = Math<T>::power(raw, T(1.05));
         scaled = Math<T>::power(scaled / T(top.rods), T(1.05)) * T(top.rods) * modifier;
         moderation = T(1.5) + T(1.5)*insertion + insertion;
@@ -116,36 +147,36 @@ template<class T> struct State {
                     hardness /= moderation;
                     fuel_energy += absorbed*T(10);
                 } else {
-                    T absorbed = intensity*T(0.972)*(T(1)-hardness);
+                    T absorbed = intensity*absorption*(T(1)-hardness);
                     intensity = maximum(T(0), intensity-absorbed);
-                    hardness /= T(3.074);
-                    environment_energy += T(0.91)*absorbed*T(10);
+                    hardness /= moderator_moderation;
+                    environment_energy += heat_efficiency*absorbed*T(10);
                 }
             }
         }
         fertility += absorbed_fuel;
         fuel_heat += fuel_energy/fuel_capacity;
-        reactor_heat += environment_energy/T(3430);
+        reactor_heat += environment_energy/reactor_capacity;
         fertility = maximum(T(0), fertility-maximum(T(0.1),fertility/T(20)));
         T difference = fuel_heat-reactor_heat;
         if (difference > T(0.01)) {
             T transferred = difference*htc;
             fuel_heat = (fuel_heat*fuel_capacity-transferred)/fuel_capacity;
-            reactor_heat = (reactor_heat*T(3430)+transferred)/T(3430);
+            reactor_heat = (reactor_heat*reactor_capacity+transferred)/reactor_capacity;
         }
         difference = reactor_heat-T(20);
         power = 0;
         if (difference > T(0.01)) {
-            T transferred = difference*T(176.4);
-            T energy = reactor_heat*T(3430);
+            T transferred = difference*cooling;
+            T energy = reactor_heat*reactor_capacity;
             transferred *= T(0.2);
             power = transferred*T(0.5)*T(12)*variant;
-            reactor_heat = (energy-transferred)/T(3430);
+            reactor_heat = (energy-transferred)/reactor_capacity;
         }
         difference = reactor_heat-T(20);
         if (difference > T(0.000001)) {
-            T lost = maximum(T(1),difference*T(0.486));
-            reactor_heat = maximum(T(0),reactor_heat*T(3430)-lost)/T(3430);
+            T lost = maximum(T(1),difference*heat_loss);
+            reactor_heat = maximum(T(0),reactor_heat*reactor_capacity-lost)/reactor_capacity;
         }
         fuel_heat = maximum(T(0),fuel_heat);
         reactor_heat = maximum(T(0),reactor_heat);
@@ -161,7 +192,7 @@ template<class T> struct State {
 };
 // Bounded fixed-tick evaluator: just accumulators, no GPU sample-window spills.
 template<class T> ER2_INLINE Result evaluate_fixed(Layout mask, Settings settings, SimConfig config) {
-    Topology top(mask);
+    Topology top(mask,settings);
     if (!top.rods) return Result{};
     State<T> state(top, settings);
     T sum_power=0, sum_fuel=0;

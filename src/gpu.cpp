@@ -65,10 +65,11 @@ Library find_nvrtc() {
 }
 }
 struct Gpu::Impl {
-    Library driver=nullptr,nvrtc=nullptr;
+    Library driver=nullptr,nvrtc=nullptr,builtins=nullptr;
     void* context=nullptr; void* module=nullptr; void* kernel=nullptr;
     unsigned long long inputs=0,outputs=0;
     int capacity=0;
+    int cells=49;
     std::string device_name;
     int (*ctx_destroy)(void*)=nullptr;
     int (*module_unload)(void*)=nullptr;
@@ -82,10 +83,12 @@ struct Gpu::Impl {
         if (outputs && mem_free) mem_free(outputs);
         if (module && module_unload) module_unload(module);
         if (context && ctx_destroy) ctx_destroy(context);
-        close_library(nvrtc); close_library(driver);
+        close_library(nvrtc); close_library(builtins); close_library(driver);
     }
 };
-Gpu::Gpu(bool exact,int device,int capacity):impl(std::make_unique<Impl>()) {
+Gpu::Gpu(bool exact,int device,int capacity,int cells):impl(std::make_unique<Impl>()) {
+    if(cells<1||cells>1024)throw std::runtime_error("GPU footprint must be 1..1024 cells");
+    impl->cells=cells;
 #ifdef _WIN32
     impl->driver=open_library("nvcuda.dll");
 #else
@@ -110,13 +113,26 @@ Gpu::Gpu(bool exact,int device,int capacity):impl(std::make_unique<Impl>()) {
     check(load<int(*)(void**,unsigned,int)>(driver,"cuCtxCreate_v2")(&impl->context,0,gpu_device),"cuCtxCreate");
     impl->nvrtc=find_nvrtc();
     auto rtc=impl->nvrtc;
+#ifdef _WIN32
+    // NVRTC opens its builtins by basename. Preload the matching companion from
+    // its own directory so a project-local or ER2_NVRTC_PATH runtime works too.
+    wchar_t rtc_path[32768]{};
+    if(GetModuleFileNameW(rtc,rtc_path,32768)) {
+        int rtc_major=0,rtc_minor=0;
+        if(load<int(*)(int*,int*)>(rtc,"nvrtcVersion")(&rtc_major,&rtc_minor)==0) {
+            auto builtin_name="nvrtc-builtins64_"+std::to_string(rtc_major)+std::to_string(rtc_minor)+".dll";
+            impl->builtins=open_library(std::filesystem::path(rtc_path).parent_path()/builtin_name);
+        }
+    }
+#endif
     auto create=load<int(*)(void**,const char*,const char*,int,const char* const*,const char* const*)>(rtc,"nvrtcCreateProgram");
     auto compile=load<int(*)(void*,int,const char* const*)>(rtc,"nvrtcCompileProgram");
     auto destroy=load<int(*)(void**)>(rtc,"nvrtcDestroyProgram");
     void* program=nullptr;
     check(create(&program,kernel_source,"reactor.cu",0,nullptr,nullptr),"nvrtcCreateProgram");
     std::string arch="--gpu-architecture=compute_"+std::to_string(major)+std::to_string(minor);
-    std::vector<const char*> options={"--std=c++17",arch.c_str(),"--fmad=false"};
+    std::string topology="-DER2_TOPOLOGY_CELLS="+std::to_string(cells);
+    std::vector<const char*> options={"--std=c++17",arch.c_str(),"--fmad=false",topology.c_str()};
     if (exact) options.push_back("-DER2_GPU_DOUBLE");
     int status=compile(program,static_cast<int>(options.size()),options.data());
     if (status) {
@@ -147,6 +163,7 @@ Gpu::Gpu(bool exact,int device,int capacity):impl(std::make_unique<Impl>()) {
 Gpu::~Gpu()=default;
 const std::string& Gpu::name() const { return impl->device_name; }
 void Gpu::evaluate(std::span<const Layout> masks,std::span<Result> output,Settings settings,SimConfig config) {
+    if(settings.cells()!=impl->cells)throw std::runtime_error("GPU was compiled for a different footprint");
     if (masks.size()!=output.size() || masks.size()>size_t(impl->capacity)) throw std::runtime_error("GPU batch exceeds capacity");
     if (masks.empty()) return;
     int count=static_cast<int>(masks.size());
