@@ -82,10 +82,26 @@ def main():
         data=json.loads(gpu.with_suffix('.json').read_text())
         assert data['settings']['backend']=='cuda'
         assert data['result']['power_fe_t']>=350000 and data['run']['exact_cpu_verified']
+        stats=data['run']
+        assert stats['candidate_evaluations']==stats['simulation_evaluations']+stats['cache_hits']
+        assert stats['batch_duplicates']<=stats['cache_hits']
+        assert stats['reactor_ticks']==stats['simulation_evaluations']*4500
         run('--backend','cuda','--threads',12,'--evaluations',16384,'--min-power',350000,'--output',first)
         assert json.loads(first.with_suffix('.json').read_text())['result']==data['result'],'Fixed-budget GPU run was nondeterministic'
         # The double GPU path is separately compiled; keep its validation sample bounded.
         run('--backend','cuda','--math','exact','--self-test','--threads',4,'--validation-layouts',32)
+        # Discovery slack may keep a near-target estimate, but final acceptance
+        # must use the original floor even when every proposal is a cache reuse.
+        full=scratch/'full_reference'
+        run('--backend','cpu','--math','exact','--evaluate',hex(ato.ALL_MASK),
+            '--search-max-ticks',20000,'--search-min-ticks',6666,'--sample-ticks',1000,'--output',full)
+        full_power=json.loads(full.with_suffix('.json').read_text())['result']['power_fe_t']
+        rejected=scratch/'strict_floor_rejected'
+        log=run('--backend','cuda','--threads',4,'--evaluations',512,
+                '--min-rods',49,'--max-rods',49,'--min-power',full_power*1.001,
+                '--discovery-power-slack',.002,'--output',rejected,expected=3)
+        assert 'No result was saved' in log
+        assert not rejected.with_suffix('.json').exists() and not rejected.with_suffix('.txt').exists()
     print('PASS: deterministic budgets, power-floor enforcement, exact verification, CLI bounds, and output JSON')
 
 if __name__=='__main__':

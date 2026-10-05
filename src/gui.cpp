@@ -290,8 +290,10 @@ void draw_ui() {
     if(busy&&s.stage=="Searching"&&have)summary=meets?"Power target met in search - verifying at finish":"Below target: "+compact(std::max(0.,used.minimum_power-result.power))+" FE/t more needed";
     text(d,{rx*scale,(progress_y+14)*scale},summary.c_str(),small,!s.error.empty()||(have&&!meets)?IM_COL32(255,180,121,255):muted);
     if(s.progress.candidates){
-        std::string rate=counted(s.progress.candidates)+" evaluations  /  "+compact(double(s.progress.candidates)/std::max(.0001,s.progress.seconds))+" per sec";
+        std::string rate=counted(s.progress.simulation_evaluations)+" simulations  /  "+compact(double(s.progress.simulation_evaluations)/std::max(.0001,s.progress.seconds))+" per sec";
         text(d,{rx*scale,(progress_y+35)*scale},rate.c_str(),small,muted);
+        if(ImGui::IsMouseHoveringRect({rx*scale,(progress_y+35)*scale},{(rx+rw)*scale,(progress_y+54)*scale}))
+            ImGui::SetTooltip("%llu candidate proposals\n%llu complete reactor simulations\n%llu exact result reuses (%llu within batches)\nOnly simulated layouts and ticks count toward calculation rates.",s.progress.candidates,s.progress.simulation_evaluations,s.progress.cache_hits,s.progress.batch_duplicates);
         char activity[180];
         if(busy&&s.stage=="Searching"&&batch_age>2)std::snprintf(activity,sizeof(activity),"Last batch %.1fs ago: %s",batch_age,s.phase.c_str());
         else std::snprintf(activity,sizeof(activity),"%d agents  /  %llu restarts  /  last improvement %.1fs ago",s.progress.agents,s.progress.restarts,std::max(0.,duration-s.progress.last_improvement_seconds));
@@ -354,7 +356,8 @@ void fonts() {
     auto& io=ImGui::GetIO();io.Fonts->Clear();wchar_t windows_dir[MAX_PATH]{};GetWindowsDirectoryW(windows_dir,MAX_PATH);auto dir=std::filesystem::path(windows_dir)/"Fonts";
     auto add=[&](const wchar_t* name,float size){auto p=utf8(dir/name);auto* f=io.Fonts->AddFontFromFileTTF(p.c_str(),size*scale);return f?f:io.Fonts->AddFontDefault();};
     body=add(L"segoeui.ttf",18);small=add(L"segoeui.ttf",14);bold=add(L"segoeuib.ttf",17);heading=add(L"segoeuisl.ttf",31);big=add(L"segoeuisl.ttf",28);io.FontDefault=body;
-    io.Fonts->Build();
+    // DX11 is initialized first to advertise dynamic texture updates. Preload
+    // common glyphs through that atlas rather than the legacy Build() path.
     for(auto* font:{body,small,bold,heading,big}){auto* baked=font->GetFontBaked(font->LegacySize);for(ImWchar c=32;c<127;++c)baked->FindGlyph(c);}
 }
 void style() {
@@ -375,7 +378,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int show) {
     BOOL dark=TRUE;DwmSetWindowAttribute(window,20,&dark,sizeof(dark));int corners=2;DwmSetWindowAttribute(window,33,&corners,sizeof(corners));
     if(!create_device(window)){MessageBoxW(nullptr,L"Could not initialize DirectX 11.",L"ATM10 Optimizer",MB_OK|MB_ICONERROR);DestroyWindow(window);CoUninitialize();return 1;}
     if(!hidden){ShowWindow(window,show);UpdateWindow(window);}IMGUI_CHECKVERSION();ImGui::CreateContext();ImGui::GetIO().IniFilename=nullptr;ImGui::GetIO().ConfigFlags|=ImGuiConfigFlags_NavEnableKeyboard;
-    fonts();style();ImGui_ImplWin32_Init(window);ImGui_ImplDX11_Init(device,context);
+    ImGui_ImplWin32_Init(window);ImGui_ImplDX11_Init(device,context);fonts();style();
     if(demo){configuration.seconds=5;configuration.minimum_power=350000;job.start(configuration,false);}
     if(!smoke_report.empty()){
         if(target_test){configuration.backend=1;configuration.seconds=5;configuration.minimum_power=350000;}
@@ -396,7 +399,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int show) {
         if(!demo||!job.busy)++settled_frames;else settled_frames=0;
         if(!capture.empty()&&settled_frames>8){captured=screenshot(capture);result_code=captured?0:2;quit=true;}
         if(!smoke_report.empty()&&frames>3&&!job.busy){auto s=job.snapshot();std::ofstream report(smoke_report);bool pass=s.code==0&&s.verified&&s.result.rods>0&&s.result.rods<=configuration.width*configuration.depth&&std::filesystem::exists(utfpath(configuration.output)/"best_reactor.json")&&(target_test?s.result.power>=350000&&s.progress.candidates>0:s.progress.candidates==512);
-            report<<"GUI button / worker test: "<<(pass?"PASS":"FAIL")<<"\nRendered frames: "<<frames<<"\nRun button activated with ImGui mouse events\nGeometry: "<<configuration.width<<" x "<<configuration.depth<<" x "<<configuration.height<<"\nModerator: "<<moderators[configuration.moderator].key<<"\nExact CPU verified: "<<s.verified<<"\nPower: "<<std::setprecision(17)<<s.result.power<<" FE/t\nMinimum power: "<<configuration.minimum_power<<" FE/t\nEvaluations: "<<s.progress.candidates<<"\n";result_code=pass?0:3;quit=true;}
+            report<<"GUI button / worker test: "<<(pass?"PASS":"FAIL")<<"\nRendered frames: "<<frames<<"\nRun button activated with ImGui mouse events\nGeometry: "<<configuration.width<<" x "<<configuration.depth<<" x "<<configuration.height<<"\nModerator: "<<moderators[configuration.moderator].key<<"\nExact CPU verified: "<<s.verified<<"\nPower: "<<std::setprecision(17)<<s.result.power<<" FE/t\nMinimum power: "<<configuration.minimum_power<<" FE/t\nCandidate proposals: "<<s.progress.candidates<<"\nComplete simulations: "<<s.progress.simulation_evaluations<<"\nExact reuses: "<<s.progress.cache_hits<<"\n";result_code=pass?0:3;quit=true;}
         if(hidden&&std::chrono::steady_clock::now()-start>std::chrono::seconds(60)){job.control.finish=true;result_code=4;quit=true;}
         swap_chain->Present(hidden?0:1,0);if(hidden)Sleep(8);
     }

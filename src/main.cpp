@@ -37,10 +37,11 @@ struct Options {
     SimConfig sim;
     int threads=std::max(1U,std::thread::hardware_concurrency()), min_rods=1,max_rods=0;
     int batch=65536,device=0,final_ticks=20000,progress_ms=1000,validation_layouts=128;
-    double seconds=60,min_power=0;
+    int cache_mb=32;
+    double seconds=60,min_power=0,discovery_power_slack=0.002;
     unsigned long long seed=1337,evaluations=0;
     std::string backend="auto",math="fast",objective="efficiency",output="best_reactor",moderator="unobtainium";
-    bool benchmark_only=false,list_moderators=false;
+    bool benchmark_only=false,list_moderators=false,deduplicate=true;
     bool calibrate=false,benchmark=false,self_test=false,quiet=false,fixed=false,has_mask=false;
     Layout mask=0;
 };
@@ -50,6 +51,7 @@ void help() {
         "  --seconds 60             search wall-clock budget (startup/final verification extra)\n"
         "  --threads N              CPU evaluation/verification workers\n"
         "  --min-power 350000       exact verified minimum FE/t\n"
+        "  --discovery-power-slack 0.002  float GPU near-floor retention buffer, 0..0.05\n"
         "  --min-rods 1             all interior positions available by default\n"
         "  --max-rods N             optional CLI constraint, otherwise full footprint\n"
         "  --width 7 --depth 7 --height 7  interior; width/depth 1..32, height 1..64\n"
@@ -66,11 +68,13 @@ void help() {
         "  --crossover-percent 20 --random-percent 20\n"
         "  --migration-generations 25 --restart-generations 100 (0 disables)\n"
         "  --evaluations N          fixed candidate budget, overrides seconds (deterministic)\n"
+        "  --cache-mb 32            bounded same-run result cache (0 disables persistence)\n"
+        "  --no-dedup               disable within-batch deduplication for comparisons\n"
         "  --progress-ms 1000 --output best_reactor --quiet\n"
         "  --calibrate --benchmark --self-test --validation-layouts 128\n"
         "  --benchmark-only         benchmark and exit without a search\n"
         "  --evaluate 0x1555555555555 [--fixed-ticks]  inspect one mask\n"
-        "One evaluation = one complete layout simulation; ticks/s is reported separately.\n";
+        "Evaluations/s counts complete simulations; proposals and exact cache reuse are separate.\n";
 }
 Options parse(int argc,char** argv) {
     Options o;
@@ -101,6 +105,7 @@ Options parse(int argc,char** argv) {
         else if(key=="--moderator")o.moderator=value();
         else if(key=="--list-moderators")o.list_moderators=true;
         else if(key=="--min-power")o.min_power=real();
+        else if(key=="--discovery-power-slack")o.discovery_power_slack=real();
         else if(key=="--insertion")o.settings.insertion=real()/100;
         else if(key=="--fill")o.settings.fill=real();
         else if(key=="--variant-efficiency")o.settings.variant=real();
@@ -109,6 +114,8 @@ Options parse(int argc,char** argv) {
         else if(key=="--sample-ticks")o.sim.sample_ticks=integer();
         else if(key=="--final-ticks")o.final_ticks=integer();
         else if(key=="--batch")o.batch=integer();
+        else if(key=="--cache-mb")o.cache_mb=integer();
+        else if(key=="--no-dedup")o.deduplicate=false;
         else if(key=="--device")o.device=integer();
         else if(key=="--progress-ms")o.progress_ms=integer();
         else if(key=="--validation-layouts")o.validation_layouts=integer();
@@ -141,6 +148,7 @@ Options parse(int argc,char** argv) {
     if(!valid_tuning(o.search))
         throw std::runtime_error("agents 1..32, elites 1..256, max-flips 1..1024, percentages 0..100, generation intervals 0..1000000");
     if(o.seconds<=0||o.min_power<0)throw std::runtime_error("seconds must be positive; min-power must be nonnegative");
+    if(o.discovery_power_slack<0||o.discovery_power_slack>0.05)throw std::runtime_error("discovery-power-slack must be 0..0.05");
     if(o.settings.width<1||o.settings.width>32||o.settings.depth<1||o.settings.depth>32||o.settings.height<1||o.settings.height>64)throw std::runtime_error("interior width/depth must be 1..32; height 1..64");
     bool explicit_max=false;for(int i=1;i<argc;++i)if(std::string(argv[i])=="--max-rods")explicit_max=true;
     if(!explicit_max)o.max_rods=o.settings.cells();
@@ -150,6 +158,7 @@ Options parse(int argc,char** argv) {
     if(o.settings.insertion<0||o.settings.insertion>1||o.settings.fill<=0||o.settings.fill>1||o.settings.variant<=0)throw std::runtime_error("invalid insertion, fill, or variant efficiency");
     if(o.sim.min_ticks<1||o.sim.max_ticks<o.sim.min_ticks||o.sim.sample_ticks<1||o.sim.sample_ticks>8192||o.sim.sample_ticks>o.sim.max_ticks||o.final_ticks<o.sim.sample_ticks)throw std::runtime_error("invalid simulation tick limits (sample-ticks 1..8192)");
     if(o.batch<1||o.batch>131072||o.progress_ms<1||o.validation_layouts<4||o.validation_layouts>4096)throw std::runtime_error("invalid batch, progress, or validation count");
+    if(o.cache_mb>1024)throw std::runtime_error("cache-mb must be 0..1024");
     if(o.backend!="auto"&&o.backend!="cpu"&&o.backend!="cuda")throw std::runtime_error("backend must be auto, cpu, or cuda");
     if(o.math!="exact"&&o.math!="fast")throw std::runtime_error("math must be exact or fast");
     if(o.objective!="efficiency"&&o.objective!="power")throw std::runtime_error("objective must be efficiency or power");
@@ -199,7 +208,10 @@ Layout cross(Settings settings) {
 }
 Layout random_layout(std::mt19937_64& rng,int lo,int hi,int cells,bool uniform=false) {
     int n=lo+int(rng()%unsigned(hi-lo+1));if(!uniform)n=std::min(n,lo+int(rng()%unsigned(hi-lo+1)));
-    Layout mask;int count=0;while(count<n) {int cell=int(rng()%cells);if(!mask.test(cell)){mask.set(cell);++count;}}return mask;
+    // Sampling the minority avoids coupon-collector work for dense scouts.
+    bool dense=n>cells/2;Layout mask=dense?full_mask(cells):Layout{};
+    int wanted=dense?cells-n:n,count=0;
+    while(count<wanted) {int cell=int(rng()%cells);if(mask.test(cell)==dense){mask.toggle(cell);++count;}}return mask;
 }
 Layout mutate(Layout mask,std::mt19937_64& rng,int lo,int hi,int cells,const SearchTuning& tuning) {
     int count=rod_count(mask);
@@ -235,7 +247,7 @@ void print_result(const Result& r,const Options& o) {
         <<"\nMask: "<<mask_hex(r.mask)<<"\nTicks: "<<r.ticks<<'\n';
 }
 void save(const Result& r,const Options& o,const std::string& backend,const std::string& device,
-          double runtime,unsigned long long candidates,unsigned long long ticks,bool verified,const Progress* stats=nullptr,bool live_changed=false) {
+          double runtime,unsigned long long candidates,unsigned long long ticks,bool verified,const Progress* stats=nullptr,bool live_changed=false,const GpuDiagnostics* gpu_stats=nullptr) {
     auto path_utf8=[](const std::string& s){return std::filesystem::path(std::u8string(s.begin(),s.end()));};
     std::filesystem::path prefix=path_utf8(o.output);
     if(!prefix.parent_path().empty())std::filesystem::create_directories(prefix.parent_path());
@@ -248,7 +260,7 @@ void save(const Result& r,const Options& o,const std::string& backend,const std:
         <<", \"mutation_percent\": "<<o.search.mutation_percent<<", \"max_flips\": "<<o.search.max_flips<<", \"move_percent\": "<<o.search.move_percent
         <<", \"crossover_percent\": "<<o.search.crossover_percent<<", \"random_percent\": "<<o.search.random_percent
         <<", \"migration_generations\": "<<o.search.migration_generations<<", \"restart_generations\": "<<o.search.restart_generations<<"}"
-        <<", \"min_power\": "<<o.min_power<<",\n    \"insertion_percent\": "<<o.settings.insertion*100
+        <<", \"min_power\": "<<o.min_power<<", \"discovery_power_slack\": "<<o.discovery_power_slack<<", \"discovery_min_power\": "<<(stats?stats->discovery_minimum_power:o.min_power)<<",\n    \"insertion_percent\": "<<o.settings.insertion*100
         <<", \"fuel_fill\": "<<o.settings.fill<<", \"variant_efficiency\": "<<o.settings.variant
         <<",\n    \"search_max_ticks\": "<<o.sim.max_ticks<<", \"search_min_ticks\": "<<o.sim.min_ticks
         <<", \"sample_ticks\": "<<o.sim.sample_ticks<<", \"final_ticks\": "<<o.final_ticks
@@ -256,14 +268,27 @@ void save(const Result& r,const Options& o,const std::string& backend,const std:
         <<", \"final_sample_ticks\": "<<std::max(o.sim.sample_ticks,std::min(1000,o.final_ticks))
         <<",\n    \"backend_requested\": "<<quote(o.backend)<<", \"backend\": "<<quote(backend)
         <<", \"math\": "<<quote(o.math)<<", \"objective\": "<<quote(o.objective)<<", \"fixed_ticks\": "<<(o.fixed?"true":"false")
-        <<",\n    \"batch\": "<<o.batch<<", \"device_index\": "<<o.device<<", \"device_name\": "<<quote(device)
-        <<",\n    \"geometry\": ["<<o.settings.width<<","<<o.settings.depth<<","<<o.settings.height<<"], \"atm10_fuel_multiplier\": 0.8, \"atm10_power_multiplier\": 12,\n"
+        <<",\n    \"batch\": "<<o.batch<<", \"cache_mb\": "<<o.cache_mb<<", \"batch_deduplication\": "<<(o.deduplicate?"true":"false")<<", \"device_index\": "<<o.device<<", \"device_name\": "<<quote(device);
+    if(gpu_stats)json<<",\n    \"gpu_block_threads\": "<<gpu_stats->block_threads<<", \"gpu_layout_words\": "<<gpu_stats->layout_words
+        <<", \"gpu_input_bytes_per_layout\": "<<gpu_stats->input_bytes_per_layout<<", \"gpu_output_bytes_per_layout\": "<<gpu_stats->output_bytes_per_layout
+        <<", \"gpu_registers_per_thread\": "<<gpu_stats->registers_per_thread<<", \"gpu_local_bytes_per_thread\": "<<gpu_stats->local_bytes_per_thread
+        <<", \"gpu_shared_bytes_per_block\": "<<gpu_stats->shared_bytes_per_block
+        <<", \"gpu_double_precision\": "<<(gpu_stats->double_precision?"true":"false")<<", \"gpu_fma\": "<<(gpu_stats->fma?"true":"false")
+        <<", \"gpu_reciprocal_divisors\": "<<(gpu_stats->reciprocal_divisors?"true":"false")<<", \"gpu_packed_rays\": "<<(gpu_stats->packed_rays?"true":"false")
+        <<", \"gpu_unroll_rays\": "<<(gpu_stats->unroll_rays?"true":"false")<<", \"gpu_branchless_rays\": "<<(gpu_stats->branchless_rays?"true":"false")
+        <<", \"gpu_settings_specialized\": "<<(gpu_stats->settings_specialized?"true":"false")<<", \"gpu_group_rods\": "<<(gpu_stats->group_rods?"true":"false");
+    json<<",\n    \"geometry\": ["<<o.settings.width<<","<<o.settings.depth<<","<<o.settings.height<<"], \"atm10_fuel_multiplier\": 0.8, \"atm10_power_multiplier\": 12,\n"
         <<"    \"moderator\": {\"key\": "<<quote(o.moderator)<<", \"name\": "<<quote(find_moderator(o.moderator)->name)
         <<", \"absorption\": "<<o.settings.moderator.absorption<<", \"heat_efficiency\": "<<o.settings.moderator.heat_efficiency
         <<", \"moderation\": "<<o.settings.moderator.moderation<<", \"conductivity\": "<<o.settings.moderator.conductivity<<"},\n"
         <<"    \"source_schedule\": \"one event per tick, columns cycled as in ato.py\"\n  },\n"
         <<"  \"run\": {\"search_seconds\": "<<runtime<<", \"candidate_evaluations\": "<<candidates
-        <<", \"reactor_ticks\": "<<ticks<<", \"layouts_per_second\": "<<(runtime>0?candidates/runtime:0)
+        <<", \"simulation_evaluations\": "<<(stats?stats->simulation_evaluations:candidates)
+        <<", \"cache_hits\": "<<(stats?stats->cache_hits:0)<<", \"batch_duplicates\": "<<(stats?stats->batch_duplicates:0)
+        <<", \"reactor_ticks\": "<<ticks<<", \"layouts_per_second\": "<<(runtime>0?(stats?stats->simulation_evaluations:candidates)/runtime:0)
+        <<", \"proposals_per_second\": "<<(runtime>0?candidates/runtime:0)
+        <<", \"generation_seconds\": "<<(stats?stats->generation_seconds:0)<<", \"simulation_seconds\": "<<(stats?stats->simulation_seconds:0)
+        <<", \"reuse_seconds\": "<<(stats?stats->reuse_seconds:0)<<", \"selection_seconds\": "<<(stats?stats->selection_seconds:0)
         <<", \"generations\": "<<(stats?stats->generation:0)<<", \"population_restarts\": "<<(stats?stats->restarts:0)
         <<", \"champion_improvements\": "<<(stats?stats->improvements:0)<<", \"live_tuning_changed\": "<<(live_changed?"true":"false")
         <<", \"exact_cpu_verified\": "<<(verified?"true":"false")<<"},\n  \"result\": {\n"
@@ -276,6 +301,7 @@ void save(const Result& r,const Options& o,const std::string& backend,const std:
         <<std::setprecision(12)<<"\nPower: "<<r.power<<" FE/t\nFuel: "<<r.fuel<<" mB/t\nEfficiency: "<<r.efficiency
         <<" FE/mB\nRod columns: "<<r.rods<<"\nFuel heat: "<<r.fuel_heat<<" C\nReactor heat: "<<r.reactor_heat
         <<" C\nFertility: "<<r.fertility<<"\nSearch time: "<<runtime<<" s\nCandidates: "<<candidates<<"\nBackend: "<<backend
+        <<"\nComplete simulations: "<<(stats?stats->simulation_evaluations:candidates)<<"\nExact discovery reuses: "<<(stats?stats->cache_hits:0)
         <<"\nExact CPU verified: "<<(verified?"yes":"no")<<'\n';
     json.flush();txt.flush();if(!json||!txt)throw std::runtime_error("Error writing result output");
 }
@@ -346,23 +372,86 @@ void benchmark(Gpu* gpu,Pool& pool,const Options& o) {
     run("Checkerboard CPU double, all requested workers",[&]{pool.run(n,[&](size_t i){results[i]=evaluate_exact(masks[i],o.settings,o.sim);});});
 }
 struct MaskHash {
+    int words=16;
     size_t operator()(const Layout& mask) const {
-        size_t h=0;for(auto word:mask.words)h^=std::hash<unsigned long long>{}(word)+0x9e3779b9+(h<<6)+(h>>2);return h;
+        size_t h=0;for(int i=0;i<words;++i)h^=std::hash<unsigned long long>{}(mask.words[i])+0x9e3779b9+(h<<6)+(h>>2);return h;
     }
 };
-std::vector<Result> retain(std::vector<Result>& population,size_t limit,const Options& o) {
+unsigned long long mask_fingerprint(const Layout& mask,int words) {
+    auto mix=[](unsigned long long x) {x^=x>>30;x*=0xbf58476d1ce4e5b9ULL;x^=x>>27;x*=0x94d049bb133111ebULL;return x^(x>>31);};
+    unsigned long long h=mix(mask.words[0]);
+    for(int i=1;i<words;++i)h=mix(h^mask.words[i]);
+    return h?h:1;
+}
+// This object belongs to one search invocation. The numerical path, settings,
+// and discovery tick protocol stay immutable during that invocation.
+class DiscoveryCache {
+    struct Values {
+        double power=0,fuel=0,efficiency=0,fuel_heat=0,reactor_heat=0,fertility=0;
+        int rods=0,ticks=0;
+        Values()=default;
+        explicit Values(const Result& r):power(r.power),fuel(r.fuel),efficiency(r.efficiency),fuel_heat(r.fuel_heat),reactor_heat(r.reactor_heat),fertility(r.fertility),rods(r.rods),ticks(r.ticks){}
+        Result result(Layout mask) const {return {mask,power,fuel,efficiency,fuel_heat,reactor_heat,fertility,rods,ticks};}
+    };
+    struct Slot {unsigned long long fingerprint=0;Values values;};
+    int words;
+    size_t capacity=0;
+    std::vector<Slot> slots;
+    std::vector<unsigned long long> keys;
+public:
+    explicit DiscoveryCache(int cells,int megabytes):words((cells+63)/64) {
+        size_t available=size_t(megabytes)*1024*1024/(sizeof(Slot)+sizeof(unsigned long long)*words);
+        if(available) {capacity=std::bit_floor(available);slots.resize(capacity);keys.resize(capacity*words);}
+    }
+    unsigned long long hash(const Layout& mask) const {
+        return mask_fingerprint(mask,words);
+    }
+    bool get(const Layout& mask,unsigned long long fingerprint,Result& result) const {
+        if(!capacity)return false;
+        size_t index=fingerprint&(capacity-1);
+        const auto& slot=slots[index];if(slot.fingerprint!=fingerprint)return false;
+        for(int i=0;i<words;++i)if(keys[index*words+i]!=mask.words[i])return false;
+        result=slot.values.result(mask);return true;
+    }
+    void put(const Result& result,unsigned long long fingerprint) {
+        if(!capacity)return;
+        size_t index=fingerprint&(capacity-1);auto& slot=slots[index];
+        slot.fingerprint=fingerprint;slot.values=Values(result);
+        for(int i=0;i<words;++i)keys[index*words+i]=result.mask.words[i];
+    }
+    size_t entries() const {return capacity;}
+};
+struct SelectionWorkspace {
+    struct Rank {double value;size_t index;};
+    std::vector<Rank> ranks;
+    std::vector<int> seen;
+};
+std::vector<Result> retain(const std::vector<Result>& population,size_t limit,const Options& o,SelectionWorkspace& scratch) {
     std::vector<Result> kept;kept.reserve(limit);
     if(population.empty())return kept;
-    std::unordered_set<Layout,MaskHash> seen;seen.reserve(limit*2);
+    const int words=(o.settings.cells()+63)/64;
+    auto& ranks=scratch.ranks;ranks.resize(population.size());
+    for(size_t i=0;i<population.size();++i)ranks[i]={score(population[i],o),i};
+    auto compare=[&](const SelectionWorkspace::Rank& a,const SelectionWorkspace::Rank& b) {
+        if(a.value!=b.value)return a.value>b.value;
+        const auto& ra=population[a.index];const auto& rb=population[b.index];
+        if(!std::isfinite(a.value)&&ra.power!=rb.power)return ra.power>rb.power;
+        for(int i=words-1;i>=0;--i)if(ra.mask.words[i]!=rb.mask.words[i])return ra.mask.words[i]<rb.mask.words[i];
+        return false;
+    };
+    auto same_mask=[&](const Layout& a,const Layout& b){for(int i=0;i<words;++i)if(a.words[i]!=b.words[i])return false;return true;};
+    auto& seen=scratch.seen;seen.resize(std::bit_ceil(std::max<size_t>(2,limit*2)));
     size_t shortlist=std::min(std::max<size_t>(limit*8,256),population.size());
     for(;;) {
-        auto compare=[&](const Result& a,const Result& b){return better(a,b,o);};
-        if(shortlist<population.size())std::nth_element(population.begin(),population.begin()+shortlist,population.end(),compare);
-        std::sort(population.begin(),population.begin()+shortlist,compare);
-        kept.clear();seen.clear();
+        if(shortlist<population.size())std::nth_element(ranks.begin(),ranks.begin()+shortlist,ranks.end(),compare);
+        std::sort(ranks.begin(),ranks.begin()+shortlist,compare);
+        kept.clear();std::fill(seen.begin(),seen.end(),0);
         for(size_t i=0;i<shortlist;++i) {
-            const auto& r=population[i];
-            if(valid(r)&&seen.insert(r.mask).second)kept.push_back(r);
+            const auto& r=population[ranks[i].index];
+            if(!valid(r))continue;
+            size_t slot=mask_fingerprint(r.mask,words)&(seen.size()-1);
+            while(seen[slot]&&!same_mask(kept[seen[slot]-1].mask,r.mask))slot=(slot+1)&(seen.size()-1);
+            if(!seen[slot]){seen[slot]=int(kept.size())+1;kept.push_back(r);}
             if(kept.size()==limit)break;
         }
         if(kept.size()==limit||shortlist==population.size())return kept;
@@ -371,11 +460,16 @@ std::vector<Result> retain(std::vector<Result>& population,size_t limit,const Op
 }
 int search(Gpu* gpu,Pool& pool,const Options& options) {
     Options o=options;
+    // Only accelerated float discovery gets a numerical retention margin.
+    // The requested floor remains the displayed and final verified threshold.
+    if(gpu&&o.math=="fast")o.min_power/=1+o.discovery_power_slack;
+    const double discovery_minimum_power=o.min_power;
     Options power_selection=o;power_selection.objective="power";
     const std::string backend=gpu?"cuda":"cpu",device=gpu?gpu->name():"CPU";
     struct Agent {
         std::mt19937_64 rng;
-        std::vector<Result> elites;
+        std::vector<Result> elites,population;
+        SelectionWorkspace selection;
         unsigned long long stagnant=0;
         bool fresh=true;
         explicit Agent(unsigned long long seed):rng(seed){}
@@ -383,32 +477,43 @@ int search(Gpu* gpu,Pool& pool,const Options& options) {
     std::vector<Agent> agents;
     for(int i=0;i<o.search.agents;++i)agents.emplace_back(o.seed+1000003ULL*i);
     std::vector<Result> archive;
+    SelectionWorkspace archive_selection;
     std::vector<Layout> masks;std::vector<Result> results;
+    DiscoveryCache cache(o.settings.cells(),o.cache_mb);
+    std::vector<Layout> pending_masks;std::vector<Result> pending_results;
+    std::vector<unsigned long long> pending_hashes;
+    std::vector<int> proposal_to_pending,batch_slots;
     std::vector<Layout> seeds={checker(o.settings),lattice(3,o.settings),lattice(2,o.settings),cross(o.settings),full_mask(o.settings.cells())};
     seeds.erase(std::remove_if(seeds.begin(),seeds.end(),[&](Layout m){int n=rod_count(m);return n<o.min_rods||n>o.max_rods;}),seeds.end());
-    unsigned long long candidates=0,ticks=0,accepted=0,generation=0,restarts=0,last_improvement_candidate=0;
-    double evaluation_time=0,generation_time=0,last_improvement_time=0;
+    unsigned long long candidates=0,simulations=0,cache_hits=0,batch_duplicates=0,ticks=0,accepted=0,generation=0,restarts=0,last_improvement_candidate=0;
+    double evaluation_time=0,generation_time=0,cache_time=0,selection_time=0,last_improvement_time=0;
     auto start=Clock::now(),next_progress=start;
     auto deadline=start+std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(o.seconds));
-    int initial_gpu_batch=std::max(128,65536*49/o.settings.cells());
+    int initial_gpu_batch=std::max(128,o.batch*49/o.settings.cells());
     if(o.math=="exact")initial_gpu_batch=std::max(128,initial_gpu_batch/16);
     int adaptive_batch=gpu?std::min(o.batch,initial_gpu_batch):std::min(o.batch,std::max(32,o.threads*8));
     bool live_changed=false;Progress latest;
     auto phase=[&](const char* name){if(run_control&&run_control->phase)run_control->phase(name);};
     auto report=[&](double time) {
-        Progress p{time,o.seconds,candidates,ticks,archive.empty()?Result{}:archive.front(),!archive.empty()&&std::isfinite(score(archive.front(),o))};
+        Progress p{time,o.seconds,candidates,ticks,archive.empty()?Result{}:archive.front(),!archive.empty()&&valid(archive.front())&&archive.front().power>=options.min_power};
         p.generation=generation;p.improvements=accepted;p.restarts=restarts;p.since_improvement=candidates-last_improvement_candidate;
         p.last_improvement_seconds=last_improvement_time;p.agents=o.search.agents;
-        std::unordered_set<Layout,MaskHash> parents;for(const auto& agent:agents)for(const auto& r:agent.elites)parents.insert(r.mask);p.distinct_parents=int(parents.size());
+        p.simulation_evaluations=simulations;p.cache_hits=cache_hits;p.batch_duplicates=batch_duplicates;
+        p.generation_seconds=generation_time;p.simulation_seconds=evaluation_time;p.reuse_seconds=cache_time;p.selection_seconds=selection_time;
+        p.discovery_minimum_power=discovery_minimum_power;
+        std::unordered_set<Layout,MaskHash> parents(0,MaskHash{(o.settings.cells()+63)/64});for(const auto& agent:agents)for(const auto& r:agent.elites)parents.insert(r.mask);p.distinct_parents=int(parents.size());
         latest=p;
         if(run_control&&run_control->progress)run_control->progress(p);
         if(!o.quiet) {
-            std::cout<<std::fixed<<std::setprecision(2)<<"Time "<<time<<" s | "<<backend<<" | "<<candidates<<" evaluations | "
-                <<candidates/std::max(time,1e-9)<<" layouts/s | "<<ticks/std::max(time,1e-9)<<" reactor ticks/s | "
+            std::cout<<std::fixed<<std::setprecision(2)<<"Time "<<time<<" s | "<<backend<<" | "<<simulations<<" simulations | "
+                <<simulations/std::max(time,1e-9)<<" layouts/s | "<<ticks/std::max(time,1e-9)<<" reactor ticks/s | "
+                <<candidates<<" proposals | "<<cache_hits<<" exact reuses | "
                 <<o.search.agents<<" agents | "<<restarts<<" restarts | "<<time-last_improvement_time<<" s since improvement\n";
             if(p.feasible)std::cout<<"Search best: "<<p.best.power<<" FE/t, "<<std::setprecision(6)<<p.best.fuel<<" mB/t, "<<p.best.efficiency<<" FE/mB, "<<p.best.rods<<" rods\n";
         }
     };
+    std::cout<<"Exact result cache: "<<cache.entries()<<" bounded entries; batch deduplication "<<(o.deduplicate?"enabled":"disabled")<<".\n";
+    if(discovery_minimum_power<options.min_power)std::cout<<"Discovery retains near-target layouts from "<<discovery_minimum_power<<" FE/t; final CPU verification still requires "<<options.min_power<<" FE/t.\n";
     stage("Searching");
     while(!finishing()&&(o.evaluations?candidates<o.evaluations:Clock::now()<deadline)) {
         if(run_control) {
@@ -456,24 +561,56 @@ int search(Gpu* gpu,Pool& pool,const Options& options) {
                 }
             }
         });
-        generation_time+=elapsed(began);began=Clock::now();phase(gpu?"Evaluating GPU batch":"Evaluating CPU batch");
-        if(gpu)gpu->evaluate(masks,results,o.settings,o.sim);else evaluate_cpu(pool,masks,results,o);
+        generation_time+=elapsed(began);began=Clock::now();phase("Reusing exact discovery results");
+        pending_masks.clear();pending_hashes.clear();proposal_to_pending.assign(count,-1);
+        if(o.deduplicate)batch_slots.assign(std::bit_ceil(size_t(count)*2),0);
+        for(int i=0;i<count;++i) {
+            auto fingerprint=cache.hash(masks[i]);
+            if(cache.get(masks[i],fingerprint,results[i])){++cache_hits;continue;}
+            size_t slot=0;
+            if(o.deduplicate) {
+                slot=fingerprint&(batch_slots.size()-1);
+                while(batch_slots[slot]) {
+                    int index=batch_slots[slot]-1;
+                    if(pending_hashes[index]==fingerprint&&pending_masks[index]==masks[i]) {
+                        proposal_to_pending[i]=index;++cache_hits;++batch_duplicates;break;
+                    }
+                    slot=(slot+1)&(batch_slots.size()-1);
+                }
+                if(proposal_to_pending[i]>=0)continue;
+                batch_slots[slot]=int(pending_masks.size())+1;
+            }
+            proposal_to_pending[i]=int(pending_masks.size());pending_masks.push_back(masks[i]);pending_hashes.push_back(fingerprint);
+        }
+        cache_time+=elapsed(began);began=Clock::now();phase(gpu?"Evaluating GPU batch":"Evaluating CPU batch");
+        pending_results.resize(pending_masks.size());
+        if(!pending_masks.empty()) {
+            if(gpu)gpu->evaluate(pending_masks,pending_results,o.settings,o.sim);else evaluate_cpu(pool,pending_masks,pending_results,o);
+        }
         double batch_time=elapsed(began);evaluation_time+=batch_time;
-        candidates+=count;for(const auto& r:results)ticks+=r.ticks;
-        phase("Selecting parents");
+        candidates+=count;simulations+=pending_results.size();for(const auto& r:pending_results)ticks+=r.ticks;
+        began=Clock::now();
+        for(size_t i=0;i<pending_results.size();++i)cache.put(pending_results[i],pending_hashes[i]);
+        for(int i=0;i<count;++i)if(proposal_to_pending[i]>=0)results[i]=pending_results[proposal_to_pending[i]];
+        cache_time+=elapsed(began);began=Clock::now();phase("Selecting parents");
         Result old=archive.empty()?Result{}:archive.front();
-        for(int lane=0;lane<active_agents;++lane) {
-            auto& agent=agents[agent_index(lane)];
-            const auto& selection=agent_index(lane)<o.search.power_agents?power_selection:o;
+        pool.run(active_agents,[&](size_t lane) {
+            auto& agent=agents[agent_index(int(lane))];
+            const auto& selection=agent_index(int(lane))<o.search.power_agents?power_selection:o;
             Result previous=agent.elites.empty()?Result{}:agent.elites.front();
-            int begin=lane*count/active_agents,end=(lane+1)*count/active_agents;
-            agent.elites.insert(agent.elites.end(),results.begin()+begin,results.begin()+end);
-            agent.elites=retain(agent.elites,o.search.elites,selection);
+            int begin=int(lane)*count/active_agents,end=(int(lane)+1)*count/active_agents;
+            agent.population.assign(agent.elites.begin(),agent.elites.end());
+            agent.population.insert(agent.population.end(),results.begin()+begin,results.begin()+end);
+            agent.elites=retain(agent.population,o.search.elites,selection,agent.selection);
             bool improved=!agent.elites.empty()&&(!previous.rods||score(agent.elites.front(),selection)>score(previous,selection)||(!std::isfinite(score(previous,selection))&&agent.elites.front().power>previous.power));
             agent.stagnant=improved?0:agent.stagnant+1;agent.fresh=false;
+        });
+        // Gather in proposal lane order so parallel selection changes no archive ordering.
+        for(int lane=0;lane<active_agents;++lane) {
+            const auto& agent=agents[agent_index(lane)];
             archive.insert(archive.end(),agent.elites.begin(),agent.elites.end());
         }
-        archive=retain(archive,128,o);
+        archive=retain(archive,128,o,archive_selection);
         ++generation;
         if(!archive.empty()&&(!old.rods||score(archive.front(),o)>score(old,o)||(!std::isfinite(score(old,o))&&archive.front().power>old.power))) {
             ++accepted;last_improvement_candidate=candidates;last_improvement_time=elapsed(start);
@@ -482,9 +619,10 @@ int search(Gpu* gpu,Pool& pool,const Options& options) {
         if(o.search.migration_generations&&generation%unsigned(o.search.migration_generations)==0&&agents.size()>1) {
             std::vector<Result> migrants;for(const auto& agent:agents)migrants.push_back(agent.elites.empty()?Result{}:agent.elites.front());
             for(size_t a=0;a<agents.size();++a)if(valid(migrants[a])) {
-                size_t receiver_id=(a+1)%agents.size();auto& receiver=agents[receiver_id];receiver.elites.push_back(migrants[a]);receiver.elites=retain(receiver.elites,o.search.elites,receiver_id<size_t(o.search.power_agents)?power_selection:o);
+                size_t receiver_id=(a+1)%agents.size();auto& receiver=agents[receiver_id];receiver.elites.push_back(migrants[a]);receiver.elites=retain(receiver.elites,o.search.elites,receiver_id<size_t(o.search.power_agents)?power_selection:o,receiver.selection);
             }
         }
+        selection_time+=elapsed(began);
         // Record best results in the global archive before clearing a stagnant population.
         for(int lane=0;lane<active_agents;++lane) {
             auto& agent=agents[agent_index(lane)];
@@ -496,13 +634,16 @@ int search(Gpu* gpu,Pool& pool,const Options& options) {
         if(gpu&&!o.evaluations&&batch_time>0.4&&adaptive_batch>128)adaptive_batch=std::max(128,int(adaptive_batch*0.3/batch_time));
         if(!o.evaluations) {
             double remaining=std::chrono::duration<double>(deadline-Clock::now()).count();
-            if(remaining>0&&batch_time>0)adaptive_batch=std::max(1,std::min(adaptive_batch,int(count*remaining/batch_time)));
+            // A fully cached batch can have near-zero simulation time. Only
+            // shrink here, keeping the floating-to-integer conversion bounded.
+            if(remaining>0&&batch_time>remaining)adaptive_batch=std::max(1,std::min(adaptive_batch,int(count*remaining/batch_time)));
         }
         if(Clock::now()>=next_progress) {report(elapsed(start));next_progress=Clock::now()+std::chrono::milliseconds(o.progress_ms);}
     }
     double runtime=elapsed(start);report(runtime);stage("Verifying finalists");phase("CPU final verification");
-    std::cout<<"Search completed: "<<candidates<<" evaluations in "<<runtime<<" s; "<<candidates/std::max(runtime,1e-9)<<" layouts/s; "
-        <<ticks/std::max(runtime,1e-9)<<" reactor ticks/s\nTiming: generation "<<generation_time<<" s, simulation/transfers "<<evaluation_time<<" s\n";
+    std::cout<<"Search completed: "<<simulations<<" simulations in "<<runtime<<" s; "<<simulations/std::max(runtime,1e-9)<<" layouts/s; "
+        <<ticks/std::max(runtime,1e-9)<<" reactor ticks/s; "<<candidates<<" proposals; "<<cache_hits<<" exact reuses ("<<batch_duplicates<<" within batches)\nTiming: generation "<<generation_time<<" s, simulation/transfers "<<evaluation_time<<" s, cache/dedup "<<cache_time<<" s, selection "<<selection_time<<" s\n";
+    o.min_power=options.min_power;
     masks.clear();for(const auto& r:archive)masks.push_back(r.mask);results.resize(masks.size());
     evaluate_cpu(pool,masks,results,o,true);
     std::sort(results.begin(),results.end(),[&](const auto& a,const auto& b){return better(a,b,o);});
@@ -511,7 +652,7 @@ int search(Gpu* gpu,Pool& pool,const Options& options) {
         std::cout<<"No exact-verified layout meets the requested power floor and rod limits. No result was saved.\n";return 3;
     }
     std::cout<<"\nBEST LAYOUT (exact CPU verified)\n";print_result(results.front(),o);
-    save(results.front(),o,backend,device,runtime,candidates,ticks,true,&latest,live_changed);
+    save(results.front(),o,backend,device,runtime,candidates,ticks,true,&latest,live_changed,gpu?&gpu->diagnostics():nullptr);
     if(run_control&&run_control->verified)run_control->verified(results.front());
     std::cout<<"Saved "<<o.output<<".txt and "<<o.output<<".json\n";return 0;
 }
@@ -534,10 +675,17 @@ int er2::optimizer_main(int argc,char** argv,RunControl* control) {
         Pool pool(o.threads);
         std::unique_ptr<er2::Gpu> gpu;
         if(o.backend!="cpu") {
-            try {stage("Preparing GPU");gpu=std::make_unique<er2::Gpu>(o.math=="exact",o.device,o.batch,o.settings.cells());}
+            try {stage("Preparing GPU");gpu=std::make_unique<er2::Gpu>(o.math=="exact",o.device,o.batch,o.settings.cells(),&o.settings);}
             catch(const std::exception& error) {if(o.backend=="cuda")throw;std::cerr<<"GPU unavailable: "<<error.what()<<"\nUsing CPU backend.\n";}
         }
         std::cout<<"ATM10 ER2 optimizer | "<<(gpu?gpu->name():"CPU")<<" | "<<o.threads<<" CPU workers | "<<o.math<<" search math\n";
+        if(gpu) {
+            const auto& d=gpu->diagnostics();
+            std::cout<<"GPU kernel: "<<d.block_threads<<" threads/block, specialization="<<d.settings_specialized<<", FMA="<<d.fma
+                <<", reciprocal divisors="<<d.reciprocal_divisors<<", packed rays="<<d.packed_rays<<", unrolled rays="<<d.unroll_rays
+                <<", branchless rays="<<d.branchless_rays<<", rod grouping="<<d.group_rods<<"\nGPU records: "<<d.input_bytes_per_layout
+                <<" input / "<<d.output_bytes_per_layout<<" output bytes per simulation; "<<d.registers_per_thread<<" registers, "<<d.local_bytes_per_thread<<" local bytes/thread\n";
+        }
         if(o.self_test||o.benchmark)validate(gpu.get(),pool,o);
         if(o.self_test) {std::cout<<"PASS: topology, baseline, finite results, numerical error, and ranking\n";return 0;}
         if(o.benchmark) {stage("Benchmarking");benchmark(gpu.get(),pool,o);return o.benchmark_only?0:search(gpu.get(),pool,o);}

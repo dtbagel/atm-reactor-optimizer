@@ -25,6 +25,10 @@ struct Progress {
     unsigned long long generation=0, improvements=0, restarts=0, since_improvement=0;
     double last_improvement_seconds=0;
     int agents=1, distinct_parents=0;
+    // Candidates count proposals; only simulations consume reactor ticks.
+    unsigned long long simulation_evaluations=0, cache_hits=0, batch_duplicates=0;
+    double generation_seconds=0, simulation_seconds=0, reuse_seconds=0, selection_seconds=0;
+    double discovery_minimum_power=0;
 };
 // Callbacks run on the optimizer worker, never on the UI/render thread.
 struct RunControl {
